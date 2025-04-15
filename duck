@@ -1,0 +1,136 @@
+#!/bin/bash
+
+declare -a duck_messages
+if [ -f /tmp/duck_messages ]; then
+  duck_messages=()
+  while IFS= read -r line; do
+    duck_messages+=("$line")
+  done < /tmp/duck_messages
+else
+  duck_messages=()
+fi
+
+VQD_CACHE_FILE="/tmp/duckduckgo_vqd"
+MODEL="o3-mini"
+
+# models
+# o3-mini
+# gpt-4o-mini
+# meta-llama/Llama-3.3-70B-Instruct-Turbo
+# mistralai/Mixtral-8x7B-Instruct-v0.1
+# claude-3-haiku-20240307
+
+# Ler da entrada padrão se não for um terminal
+piped_input=""
+if [ ! -t 0 ]; then
+  piped_input=$(cat)
+fi
+
+# Processar argumentos
+message=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    *)
+      message="${message:+$message }$1"
+      shift
+      ;;
+  esac
+done
+
+# Combinar entrada do pipe com argumentos
+if [ -n "$piped_input" ]; then
+  if [ -n "$message" ]; then
+    message="$piped_input"$'\n\n'"$message"
+  else
+    message="$piped_input"
+  fi
+fi
+
+if [ -z "$message" ]; then
+  echo "Usage: duck [--model model-name] your message"
+  echo "Or: cat input | duck [--model model-name] your message"
+  exit 1
+fi
+
+USER_AGENT='Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0'
+
+get_vqd_header() {
+  if [ -f "$VQD_CACHE_FILE" ]; then
+    cat "$VQD_CACHE_FILE"
+    return 0
+  fi
+
+  local vqd_header
+  vqd_header=$(curl -s 'https://duckduckgo.com/duckchat/v1/status' \
+    -H "User-Agent: $USER_AGENT" \
+    -H 'Accept: text/event-stream' \
+    -H 'Accept-Language: pt-BR' \
+    -H 'x-vqd-accept: 1' \
+    -I | grep -i 'x-vqd-4' | cut -d' ' -f2 | tr -d '\r')
+  if [ -n "$vqd_header" ]; then
+    echo "$vqd_header" > "$VQD_CACHE_FILE"
+    echo "$vqd_header"
+    return 0
+  fi
+  return 1
+}
+
+json_message_escape() {
+  echo -n "$1" | jq -s -R -r @json
+}
+
+# Escape the message before adding it to the array
+escaped_message=$(json_message_escape "$message")
+duck_messages+=("{\"content\": $escaped_message, \"role\": \"user\"}")
+
+messages_json=$(printf "%s," "${duck_messages[@]}")
+messages_json="[${messages_json%,}]"
+
+vqd_header=$(get_vqd_header)
+if [ -z "$vqd_header" ]; then
+  echo "Erro: Não foi possível obter o header VQD"
+  exit 1
+fi
+
+temp_response_file=$(mktemp)
+
+data_json=$(jq -n \
+  --arg messages "$messages_json" --arg model "$MODEL" '{
+    messages: $messages | fromjson,
+    model: $model
+}')
+
+curl -s 'https://duckduckgo.com/duckchat/v1/chat' -X POST \
+  -H "User-Agent: $USER_AGENT" \
+  -H 'Accept: text/event-stream' \
+  -H 'Accept-Language: pt-BR' \
+  -H 'Accept-Encoding: gzip, deflate, br, zstd' \
+  -H 'Content-Type: application/json' \
+  -H "X-Vqd-4: $vqd_header" \
+  -H 'Origin: https://duckduckgo.com' \
+  --data "$data_json" | while IFS= read -r line; do
+      if [[ $line == data:* ]]; then
+        if [[ $line =~ message\":\"([^\"]+)\" ]]; then
+            content="${BASH_REMATCH[1]}"
+            if [ ! -z "$content" ]; then
+                content=$(echo "$content" | sed 's/\\n/\n/g')
+                echo -n "$content"
+                echo -n "$content" >> "$temp_response_file"
+            fi
+        fi
+      fi
+done
+
+echo # Nova linha ao final da resposta
+
+response=$(<"$temp_response_file")
+rm "$temp_response_file"
+
+# Escape the response before adding it to the array
+escaped_response=$(json_message_escape "$response")
+duck_messages+=("{\"role\": \"user\", \"content\": $escaped_response}")
+printf '%s\n' "${duck_messages[@]}" > /tmp/duck_messages
