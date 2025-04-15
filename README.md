@@ -1,4 +1,3 @@
-Coletando informações do workspace```markdown
 # DuckDuckGo Chat CLI (duck)
 
 Este script (`duck`) é uma ferramenta de linha de comando para interagir com a API de Chat do DuckDuckGo diretamente do seu terminal. Ele permite enviar mensagens e receber respostas de vários modelos de IA suportados pelo DuckDuckGo.
