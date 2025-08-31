@@ -20,13 +20,13 @@ MODEL="o3-mini"
 # mistralai/Mistral-Small-24B-Instruct-2501
 # claude-3-haiku-20240307
 
-# Read from standard input if not a terminal
+# Ler da entrada padrão se não for um terminal
 piped_input=""
 if [ ! -t 0 ]; then
   piped_input=$(cat)
 fi
 
-# Process arguments
+# Processar argumentos
 message=""
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -41,7 +41,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Combine pipe input with arguments
+# Combinar entrada do pipe com argumentos
 if [ -n "$piped_input" ]; then
   if [ -n "$message" ]; then
     message="$piped_input"$'\n\n'"$message"
@@ -65,17 +65,29 @@ get_vqd_header() {
   fi
 
   local vqd_header
-  vqd_header=$(curl -s 'https://duckduckgo.com/duckchat/v1/status' \
+  local curl_response
+  curl_response=$(curl -s 'https://duckduckgo.com/duckchat/v1/status' \
     -H "User-Agent: $USER_AGENT" \
     -H 'Accept: text/event-stream' \
     -H 'Accept-Language: pt-BR' \
     -H 'x-vqd-accept: 1' \
-    -I | grep -i 'x-vqd-4' | cut -d' ' -f2 | tr -d '\r')
+    -I 2>&1)
+  
+  # Verificar se o curl falhou
+  if [ $? -ne 0 ]; then
+    echo "Erro: Falha na conexão para obter VQD header" >&2
+    return 1
+  fi
+  
+  vqd_header=$(echo "$curl_response" | grep -i 'x-vqd-4' | cut -d' ' -f2 | tr -d '\r')
+  
   if [ -n "$vqd_header" ]; then
     echo "$vqd_header" > "$VQD_CACHE_FILE"
     echo "$vqd_header"
     return 0
   fi
+  
+  echo "Erro: Header VQD não encontrado na resposta" >&2
   return 1
 }
 
@@ -92,7 +104,7 @@ messages_json="[${messages_json%,}]"
 
 vqd_header=$(get_vqd_header)
 if [ -z "$vqd_header" ]; then
-  echo "Error: Could not obtain VQD header"
+  echo "Erro: Não foi possível obter o header VQD"
   exit 1
 fi
 
@@ -104,7 +116,8 @@ data_json=$(jq -n \
     model: $model
 }')
 
-curl -s 'https://duckduckgo.com/duckchat/v1/chat' -X POST \
+# Executar curl e capturar saída completa (incluindo erros)
+curl_output=$(curl -s 'https://duckduckgo.com/duckchat/v1/chat' -X POST \
   -H "User-Agent: $USER_AGENT" \
   -H 'Accept: text/event-stream' \
   -H 'Accept-Language: pt-BR' \
@@ -112,23 +125,39 @@ curl -s 'https://duckduckgo.com/duckchat/v1/chat' -X POST \
   -H 'Content-Type: application/json' \
   -H "X-Vqd-4: $vqd_header" \
   -H 'Origin: https://duckduckgo.com' \
-  --data "$data_json" | while IFS= read -r line; do
-      if [[ $line == data:* ]]; then
-        if [[ $line =~ message\":\"([^\"]+)\" ]]; then
-            content="${BASH_REMATCH[1]}"
-            if [ ! -z "$content" ]; then
-                content=$(echo "$content" | sed 's/\\n/\n/g')
-                echo -n "$content"
-                echo -n "$content" >> "$temp_response_file"
-            fi
+  --data "$data_json" 2>&1)
+
+# Verificar se há erro na resposta (JSON com campo "error" ou similar)
+if echo "$curl_output" | jq -e '.error' >/dev/null 2>&1; then
+  error_msg=$(echo "$curl_output" | jq -r '.error.message // "Erro desconhecido no endpoint"')
+  echo "Erro do endpoint: $error_msg" >&2
+  rm -f "$temp_response_file"
+  exit 1
+fi
+
+# Processar streaming se não houver erro
+echo "$curl_output" | while IFS= read -r line; do
+  if [[ $line == data:* ]]; then
+    if [[ $line =~ message\":\"([^\"]+)\" ]]; then
+        content="${BASH_REMATCH[1]}"
+        if [ ! -z "$content" ]; then
+            content=$(echo "$content" | sed 's/\\n/\n/g')
+            echo -n "$content"
+            echo -n "$content" >> "$temp_response_file"
         fi
-      fi
+    fi
+  fi
 done
 
-echo # New line at the end of the response
+echo # Nova linha ao final da resposta
 
 response=$(<"$temp_response_file")
 rm "$temp_response_file"
+
+if [ -z "$response" ]; then
+  echo "Nenhuma resposta recebida do LLM." >&2
+  exit 1
+fi
 
 # Escape the response before adding it to the array
 escaped_response=$(json_message_escape "$response")
